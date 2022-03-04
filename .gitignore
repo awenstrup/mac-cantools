@@ -1,0 +1,8 @@
+.DS_Store
+hitl.egg-info
+logs
+playback_logs
+report.html
+cmd_list.md
+__pycache__
+.pytest_cache
