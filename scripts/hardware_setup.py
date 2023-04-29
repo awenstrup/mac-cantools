@@ -49,16 +49,21 @@ def install_kernel_hitl():
     print("Installing kernel hitl...")
     os.system("sudo modprobe vcan")  # for testing
     os.system("sudo modprobe peak_usb")
-    # run("sudo modprobe peak_pci") not sure if necessary
-    # run("sudo modprobe can_raw") not sure if necessary
+    run("sudo modprobe peak_pci") # not sure if necessary
+    run("sudo modprobe can_raw") # not sure if necessary
     print("Kernel hitl installed.\n")
 
 
 if __name__ == "__main__":
-    # Fail if not on linux!
-    if "linux" not in sys.platform:
+    # If on linux, setup kernel
+    if "linux" in sys.platform:
+        # create_udev_rule()
+        install_kernel_hitl()
+
+    elif "darwin" in sys.platform:
+        print("Mac HW setup not yet automated\n\nInstall the PCBSUSB library for Mac here: https://www.mac-can.com")
+
+    else:
         raise Exception(
-            "This script only works on Linux! For help with setup on another os, contact awenstrup@olin.edu"
+            "This script doesn't work on Windows! For help with setup on another os, contact alexw00@me.com"
         )
-    # create_udev_rule()
-    install_kernel_hitl()

@@ -1,20 +1,19 @@
 # Base python
+from configparser import ConfigParser
+import csv
 import os
 import sys
 import time
 import threading
 from typing import Callable, Tuple
 import logging
-import csv
-from configparser import ConfigParser
-import atexit
 
 # Extended python
 import cantools
 import can
 
 # Project Imports 
-from hitl.utils import artifacts_path
+from hitl.utils import artifacts_path, get_logging_config
 
 config = ConfigParser(interpolation=None)
 config.read(os.path.join(artifacts_path, "config.ini"))
@@ -24,60 +23,56 @@ class CANController:
 
     The CANController works **passively** for reading signals; you create one with a path to a DBC, and it keeps track of all states automatically
 
-    `Confluence <https://docs.olinelectricmotorsports.com/display/AE/CAN+Controller>`_
+    :param str channel: The name of the can channel to use.
+
+    :param int bitrate: The bitrate of the can bus. Defaults to 500K.
 
     :param str can_spec_path: The path to the can spec. For now, we only support ``.dbc`` files. Should be
         stored in ``artifacts``.
-
-    :param str channel: The name of the can channel to use. If using a virtual can bus, use ``vcan0`` or similar;
-        if using a real CAN bus, use ``can0`` or similar. You can use ``$ ip link show`` to view options.
-
-    :param int bitrate: The bitrate of the can bus. Defaults to 500K. If using a virtual bus, you can ignore this.
     """
 
     def __init__(
         self, 
-        can_spec_path: str = config.get("PATH", "dbc_path", fallback=os.path.join(artifacts_path, "veh.dbc")), 
-        channel: str = config.get("HARDWARE", "can_channel", fallback="vcan0"), 
+        channel: str = config.get("HARDWARE", "can_channel", fallback="PCAN_USBBUS1"), 
         bitrate: int = config.get("HARDWARE", "can_bitrate", fallback=500000), 
+        can_spec_path: str = config.get("PATH", "dbc_path", fallback = ""), 
+        ext_callback = None  # allow users to define custom RX callback
     ):
-        # Create logger (all config should already be set by RoadkillHarness)
+        # Create logger
+        get_logging_config()
         self.log = logging.getLogger(name=__name__)
 
         # Create empty list of periodic messages
         self.periodic_messages = {}
 
-        # Get config
-        if "linux" in sys.platform:
-            # Bring CAN hardware online
-            if "vcan" in channel:
-                os.system(f"sudo ip link add dev {channel} type vcan")
-                os.system(f"sudo ip link set {channel} up")  # virtual hardware
-            else:
-                os.system(f"sudo ip link set {channel} up type can bitrate {bitrate} restart-ms 100")  # real hardware
-        else:
-            self.log.error("Cannot bring up real or fake can hardware; must be on linux.")
-
-        self.message_of_signal, self.signals = self._create_state_dictionary(can_spec_path)
+        # Parse .dbc and generate internal state dictionary
+        self.message_of_signal, self.signals, self.unknown_messages = self._create_state_dictionary(can_spec_path)
 
         # Start listening
-        bus_type = "socketcan"
+        interface = "pcan"
 
-        if "linux" in sys.platform:
-            self.can_bus = can.interface.Bus(channel=channel, bustype=bus_type, bitrate=bitrate)
-            listener = threading.Thread(
-                target=self._listen,
-                name="listener",
-                kwargs={
-                    "can_bus": self.can_bus,
-                    "callback": self._parse_frame
-                },
+        try:
+            self.can_bus = can.interface.Bus(
+                channel=channel, 
+                interface=interface, 
+                bitrate=bitrate
             )
-            listener.daemon = True
-            listener.start()
-        else:
-            can_bus = None
-            self.log.error("Not on linux; initializing self.can to None")
+        except can.interfaces.pcan.pcan.PcanCanInitializationError:
+            raise Exception("CAN interface initialization failed. Check if your device is plugged in.")
+
+        global reset_listener
+        
+        self.listener = threading.Thread(
+            target=self._listen,
+            name="listener",
+            kwargs={
+                "can_bus": self.can_bus,
+                "callback": self._parse_frame,
+                "ext_callback": ext_callback,
+            },
+        )
+        self.listener.daemon = True
+        self.listener.start()
 
     def get_state(self, signal):
         """
@@ -87,7 +82,12 @@ class CANController:
             msg = self.message_of_signal[signal]
             return self.signals[msg][signal]
         except KeyError:
-            raise Exception(f"Cannot get state of signal '{signal}'. It wasn't found.")
+            self.log.debug("Signal not found in .dbc file, interpreting as message ID...")
+            try:
+                msg = self.unknown_messages[signal]
+                return msg
+            except KeyError:
+                raise Exception(f"Cannot get state of signal '{signal}'. It wasn't found.")
 
     def set_state(self, signal, value):
         """
@@ -137,6 +137,22 @@ class CANController:
         #send message
         send_task = self.can_bus.send_periodic(message, period)
         self.periodic_messages[msg_name] = send_task
+
+    
+    def reset_rx_thread(self, ext_callback = None):
+        reset_listener = True
+
+        self.listener = threading.Thread(
+            target=self._listen,
+            name="listener",
+            kwargs={
+                "can_bus": self.can_bus,
+                "callback": self._parse_frame,
+                "ext_callback": ext_callback,
+            },
+        )
+        self.listener.daemon = True
+        self.listener.start()
 
     def playback(self, path, initial_time=0):
         """
@@ -189,20 +205,23 @@ class CANController:
 
         :param str path: Path the the CAN spec file
         """
+        message_of_signal = {}  # signal_name (str): message name (str)
+        signals = {}  # message name (str): signals (dict(str: any))
+        unknown_messages = {}  # can id (int): data (Message)
+
         # Create database that has all the messages in the dbc file in type message
-        self.db = cantools.database.load_file(path)
+        if path:
+            self.db = cantools.database.load_file(path)
 
-        # Iterates through messages to create state dictionaries
-        message_of_signal = {}
-        signals = {}
-        for msg in self.db.messages:
-            if msg.name not in message_of_signal:
-                signals[msg.name] = {}
-            for sig in msg.signals:
-                signals[msg.name][sig.name] = 0
-                message_of_signal[sig.name] = msg.name
+            # Iterates through messages to create state dictionaries
+            for msg in self.db.messages:
+                if msg.name not in message_of_signal:
+                    signals[msg.name] = {}
+                for sig in msg.signals:
+                    signals[msg.name][sig.name] = 0
+                    message_of_signal[sig.name] = msg.name
 
-        return message_of_signal, signals
+        return message_of_signal, signals, unknown_messages
 
     def _parse_frame(self, msg):
         """
@@ -210,21 +229,44 @@ class CANController:
         
         Parses through a CAN frame and updates the self.states dictionary
         """
-        # Get the message name
-        msg_name = self.db.get_message_by_frame_id(msg.arbitration_id).name
-        # Decode the data
-        data = self.db.decode_message(msg.arbitration_id, msg.data)
-        # Update the state dictionary
-        self.signals[msg_name].update(data)
+        try:
+            # Get the message name
+            msg_name = self.db.get_message_by_frame_id(msg.arbitration_id).name
 
-    def _listen(self, can_bus: can.Bus, callback: Callable) -> None:
+            # Decode the data
+            data = self.db.decode_message(msg.arbitration_id, msg.data)
+
+            # Update the state dictionary
+            self.signals[msg_name].update(data)
+        except:
+            # If signal not defined in DBC, track raw frame data
+            self.unknown_messages[msg.arbitration_id] = msg
+
+        
+    def _listen(self, can_bus: can.Bus, callback: Callable, ext_callback: Callable) -> None:
         """Thread that runs all the time to listen to CAN messages
 
         References:
           - https://python-can.readthedocs.io/en/master/interfaces/socketcan.html
           - https://python-can.readthedocs.io/en/master/
         """
-        while True:
+        if ext_callback:
+            def rx_function(msg):
+                callback(msg)
+                ext_callback(msg)
+        else:
+            def rx_function(msg):
+                callback(msg)
+
+        reset_listener = False
+        while not reset_listener:
             msg = can_bus.recv(1)  # 1 second receive timeout
             if msg:
-                callback(msg)
+                rx_function(msg)
+
+    
+    def __del__(self):
+        try:
+            self.can_bus.shutdown()
+        except:
+            pass
